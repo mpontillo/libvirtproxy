@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,35 +9,10 @@ import (
 	"syscall"
 )
 
-var UnableToGetProcessName = errors.New("unable to get process name")
-
 type processInfo struct {
 	executable string
 	args       []string
 }
-
-/*
-func processNameByPID(pid int32) (string, error) {
-	exeLink := fmt.Sprintf("/proc/%d/exe", pid)
-	exeName, err := os.Readlink(exeLink)
-	if err != nil {
-		b := make([]byte, 1024)
-		// fall back to /proc/<pid>/procCmdlineFile
-		procCmdlineFilename := fmt.Sprintf("/proc/%d/cmdline", pid)
-		procCmdlineFile, err := os.Open(procCmdlineFilename)
-		if err != nil {
-			return "", fmt.Errorf("unable to open: %s", procCmdlineFilename)
-		}
-		n, err := procCmdlineFile.Read(b)
-		if n > 0 && (err != nil || err != io.EOF) {
-			sep := []byte{0}
-			commands := bytes.Split(b, sep)
-			return string(commands[0]), err
-		}
-		return "", UnableToGetProcessName
-	}
-	return exeName, nil
-} */
 
 func getProcessArguments(pid int32) []string {
 	procCmdlineFilename := fmt.Sprintf("/proc/%d/cmdline", pid)
@@ -73,19 +47,26 @@ func accept(client *net.UnixConn) {
 	f, err := client.File()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot get file for client: %v\n", err)
+		client.CloseWrite()
 		return
 	}
 	cred, err := syscall.GetsockoptUcred(int(f.Fd()), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot get peer credential for client: %v\n", err)
+		client.CloseWrite()
 		return
 	}
 	info := getProcessInfo(cred.Pid)
 	fmt.Fprintf(os.Stderr, "credential: %+v\ninfo: %+v\n", cred, info)
 
-	proxy, err := net.Dial("unix", "/run/libvirt/libvirt-sock")
+	proxy, err := net.DialUnix(
+		"unix",
+		&net.UnixAddr{},
+		&net.UnixAddr{Name: "/run/libvirt/libvirt-sock"},
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create proxy to libvirt: %v\n", err)
+		client.CloseWrite()
 		return
 	}
 	defer proxy.Close()
@@ -99,6 +80,8 @@ func accept(client *net.UnixConn) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error proxying request bytes: %v\n", err)
 		}
+		client.CloseRead()
+		proxy.CloseWrite()
 		requestBytesChannel <- requestSize
 	}()
 
@@ -108,6 +91,8 @@ func accept(client *net.UnixConn) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error proxying response bytes: %v\n", err)
 		}
+		proxy.CloseRead()
+		client.CloseWrite()
 		responseBytesChannel <- responseSize
 	}()
 
@@ -138,7 +123,12 @@ func main() {
 		Name: listenSocket,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to open listener for socket '%s': %v\n", listenSocket, err)
+		fmt.Fprintf(
+			os.Stderr,
+			"unable to open listener for socket '%s': %v\n",
+			listenSocket,
+			err,
+		)
 		os.Exit(2)
 	}
 	fmt.Fprintf(os.Stderr, "%s: listening on '%s'\n", binaryName, listenSocket)
