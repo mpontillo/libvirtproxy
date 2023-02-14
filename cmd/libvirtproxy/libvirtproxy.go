@@ -12,6 +12,12 @@ import (
 
 var UnableToGetProcessName = errors.New("unable to get process name")
 
+type processInfo struct {
+	executable string
+	args       []string
+}
+
+/*
 func processNameByPID(pid int32) (string, error) {
 	exeLink := fmt.Sprintf("/proc/%d/exe", pid)
 	exeName, err := os.Readlink(exeLink)
@@ -32,6 +38,34 @@ func processNameByPID(pid int32) (string, error) {
 		return "", UnableToGetProcessName
 	}
 	return exeName, nil
+} */
+
+func getProcessArguments(pid int32) []string {
+	procCmdlineFilename := fmt.Sprintf("/proc/%d/cmdline", pid)
+	procCmdlineFile, err := os.Open(procCmdlineFilename)
+	if err != nil {
+		return nil
+	}
+	b, err := io.ReadAll(procCmdlineFile)
+	if err != nil {
+		return nil
+	}
+	sep := []byte{0}
+	commands := bytes.Split(b, sep)
+	result := make([]string, len(commands), len(commands))
+	for i := 0; i < len(commands); i++ {
+		result[i] = string(commands[i])
+	}
+	return result
+}
+
+func getProcessInfo(pid int32) processInfo {
+	var info processInfo
+	exeLink := fmt.Sprintf("/proc/%d/exe", pid)
+	exeName, _ := os.Readlink(exeLink)
+	info.executable = exeName
+	info.args = getProcessArguments(pid)
+	return info
 }
 
 func accept(client *net.UnixConn) {
@@ -46,51 +80,43 @@ func accept(client *net.UnixConn) {
 		fmt.Println("Cannot get peer credential", err.Error())
 		return
 	}
-	proc, err := processNameByPID(cred.Pid)
-	if err != nil {
-		fmt.Println("Cannot get process", err.Error())
-		return
-	}
-	fmt.Fprintf(os.Stderr, "Credential: %+v\nProcess: %+v\n", cred, proc)
-	if cred.Uid == 0 {
-		fmt.Println("root client connected, do something dangerous!")
-	} else {
-		fmt.Println("non-root client connected, do nothing!")
-	}
-	//var input []byte
-	input := make([]byte, 32768)
-	output := make([]byte, 32768)
-	fmt.Fprintf(os.Stderr, "RemoteAddress String=%s Netwok=%s\n", client.RemoteAddr().String(), client.RemoteAddr().Network())
+	info := getProcessInfo(cred.Pid)
+	fmt.Fprintf(os.Stderr, "Credential: %+v\nInfo: %+v\n", cred, info)
+
 	proxy, err := net.Dial("unix", "/run/libvirt/libvirt-sock")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create proxy to libvirt: %v\n", err)
 		return
 	}
 	defer proxy.Close()
-	for {
-		n, err := client.Read(input)
-		fmt.Printf("read %d bytes (len=%d): %v\n", n, len(input), input[:n])
-		proxy.Write(input[:n])
-		if err == io.EOF {
-			return
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to read from socket: %v\n", err)
-			return
-		}
 
-		n, err = proxy.Read(output)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to read from proxy: %v\n", err)
-			return
-		}
+	requestBytesChannel := make(chan int64)
+	responseBytesChannel := make(chan int64)
 
-		_, err = client.Write(output[:n])
+	// copy data from the client to the real socket
+	go func() {
+		requestSize, err := io.Copy(proxy, client)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "unable to write to socket: %v\n", err)
-			return
+			fmt.Fprintf(os.Stderr, "error proxying request bytes: %v\n", err)
 		}
-	}
+		requestBytesChannel <- requestSize
+	}()
+
+	// copy responses from the real socket back to the client
+	go func() {
+		responseSize, err := io.Copy(client, proxy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error proxying response bytes: %v\n", err)
+		}
+		responseBytesChannel <- responseSize
+	}()
+
+	// the .Close() calls are deferred; wait to return until they complete.
+	requestSize := <-requestBytesChannel
+	fmt.Printf("proxied %d request bytes\n", requestSize)
+
+	responseSize := <-responseBytesChannel
+	fmt.Printf("proxied %d response bytes\n", responseSize)
 }
 
 func main() {
@@ -104,10 +130,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s <socket-file>\n", binaryName)
 		os.Exit(1)
 	}
-	fmt.Printf("%d: %v\n", len(args), args)
+
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{
 		Name: args[0],
-		Net:  args[0],
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to open listener for socket '%s': %v\n", args[0], err)
