@@ -72,16 +72,16 @@ func accept(client *net.UnixConn) {
 	defer client.Close()
 	f, err := client.File()
 	if err != nil {
-		fmt.Println("Cannot get underlying file", err.Error())
+		fmt.Fprintf(os.Stderr, "cannot get file for client: %v\n", err)
 		return
 	}
 	cred, err := syscall.GetsockoptUcred(int(f.Fd()), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
 	if err != nil {
-		fmt.Println("Cannot get peer credential", err.Error())
+		fmt.Fprintf(os.Stderr, "cannot get peer credential for client: %v\n", err)
 		return
 	}
 	info := getProcessInfo(cred.Pid)
-	fmt.Fprintf(os.Stderr, "Credential: %+v\nInfo: %+v\n", cred, info)
+	fmt.Fprintf(os.Stderr, "credential: %+v\ninfo: %+v\n", cred, info)
 
 	proxy, err := net.Dial("unix", "/run/libvirt/libvirt-sock")
 	if err != nil {
@@ -121,8 +121,10 @@ func accept(client *net.UnixConn) {
 
 func main() {
 	args := os.Args[1:]
+	var binaryName = "libvirtproxy"
+
+	// validate arguments
 	if len(args) != 1 {
-		binaryName := "libvirtproxy"
 		exe, err := os.Executable()
 		if err == nil {
 			binaryName = exe
@@ -130,14 +132,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "usage: %s <socket-file>\n", binaryName)
 		os.Exit(1)
 	}
+	listenSocket := args[0]
 
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{
-		Name: args[0],
+		Name: listenSocket,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "unable to open listener for socket '%s': %v\n", args[0], err)
+		fmt.Fprintf(os.Stderr, "unable to open listener for socket '%s': %v\n", listenSocket, err)
 		os.Exit(2)
 	}
+	fmt.Fprintf(os.Stderr, "%s: listening on '%s'\n", binaryName, listenSocket)
 	for {
 		conn, err := listener.AcceptUnix()
 		if err != nil {
